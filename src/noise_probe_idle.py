@@ -18,36 +18,47 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 ### set your IBM token here ###
 # os.environ["IBM_TOKEN"] = "<your-token-here>"
+
 """
-Usage:
-    python idle_noise_probe.py [population|bloch] [options]
+Idle-noise probe for IBM Quantum backends
+========================================
 
-Modes:
-    population    Measure ground-state population decay vs idle time (T1-style)
-    bloch         Measure full Bloch vector components vs idle time
+Usage
+-----
+python -m src.noise_probe_idle <mode> [options]
 
-Options:
-    --backend BACKEND_NAME        (optional) Specific backend name (e.g., ibm_brisbane).
-                                  If omitted, the least-busy device is used.
-    --num-points N                (optional) Number of idle time points (default: 50).
-    --gates-per-point N           (optional) Number of identity gates per point (default: 100).
-    --shots N                     (optional) Number of shots per circuit (default: 8192).
-    --initial-state STATE         (optional) Initial state: '0', '1', '+', '-', '+i', '-i' (default: '1').
-    --job-id JOB_ID               (optional) Retrieve results of an existing job instead of submitting a new one.
+Modes
+-----
+population   Measure ground-state population decay (T1-style)
+bloch        Measure full Bloch vector components vs idle time
 
-Examples:
-    # Run new population decay experiment on least-busy backend
-    python idle_probe.py population
+Key options
+-----------
+-b, --backend              specific backend (e.g. ibm_brisbane); if omitted, pick least busy
+-q, --qubit                physical qubit index to probe (default: 0)
+-np, --num-points          number of idle-time points       (default: 50)
+-gpp, --gates-per-point    identity gates per point         (default: 100)
+-s,  --shots               shots per circuit                (default: 8192)
+-init, --initial-state     0, 1, +, -, +i, -i               (default: 1)
+-id, --job-id              download an existing job instead of submitting
 
-    # Run bloch vector tomography with custom backend
-    python idle_probe.py bloch --backend=ibm_brisbane --initial-state="+"
+Examples
+--------
+# new population experiment on least-busy device, qubit 0
+python -m src.noise_probe_idle population
 
-    # Download existing job results and save them
-    python idle_probe.py population --job-id=abc1234567890
+# Bloch tomography on qubit 1 of ibm_strasbourg
+python -m src.noise_probe_idle bloch -b ibm_strasbourg -q 1 -np 50 -gpp 20 -init +
 
-Notes:
-    - Output files are saved in ./results/<backend>/<basename>-<timestamp>.csv and .png
-    - IBM Quantum API token must be set in environment variable: IBM_TOKEN
+# fetch results of a previously submitted job
+python -m src.noise_probe_idle population --job-id abc1234567890
+
+Notes
+-----
+* Results are stored in
+      results/<backend>/init<state>/
+      <mode>-q<qubit>-np<num>-gpp<gpp>-s<shots>-<timestamp>.{{csv,png}}
+* Set your API token with  ``export IBM_TOKEN=...``  or hard-code it in the script
 """
 
 # --------------------------------------------------------------------------
@@ -221,6 +232,7 @@ def make_paths(
     backend: str,
     init_state: str,
     mode: str,
+    qubit: int,
     num_points: int,
     gpp: int,
     shots: int,
@@ -233,7 +245,7 @@ def make_paths(
     stamp  = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     folder = Path("results") / backend / f"init{init_state}"
     folder.mkdir(parents=True, exist_ok=True)
-    name   = f"{mode}-np{num_points}-gpp{gpp}-s{shots}-{stamp}{ext}"
+    name   = f"{mode}-q{qubit}-np{num_points}-gpp{gpp}-s{shots}-{stamp}{ext}"
     return folder / name
 
 
@@ -243,15 +255,11 @@ def make_paths(
 def main():
     parser = argparse.ArgumentParser(description="Idle-noise probe on IBMQ backend")
     sub = parser.add_subparsers(dest="mode", required=True)
-    parser.add_argument(
-        "-b", "--backend",
-        type=str,
-        help="Exact backend name, e.g. ibm_brisbane. "
-            "If omitted, the least-busy operational device is used.",
-    )
 
     common = {
-        "num_points":      ("-np",  "--num-points",      int,  50),
+        "backend":         ("-b",   "--backend",         str, None),
+        "qubit":           ("-q",   "--qubit",           int, 0), 
+        "num_points":      ("-np",  "--num-points",      int, 50),
         "gates_per_point": ("-gpp", "--gates-per-point", int, 100),
         "shots":           ("-s",   "--shots",           int, 8192),
     }
@@ -259,7 +267,6 @@ def main():
     pop = sub.add_parser("population", help="T1-style population decay")
     for dest, (short, long, typ, default) in common.items():
         pop.add_argument(short, long, dest=dest, type=typ, default=default)
-
     pop.add_argument(
         "-init", "--initial-state",
         choices=["0", "1", "+", "-", "+i", "-i"],
@@ -304,6 +311,7 @@ def main():
             backend_name,
             args.initial_state,
             args.mode,             # "population" or "bloch"
+            args.qubit,
             args.num_points,
             args.gates_per_point,
             args.shots,
@@ -357,6 +365,7 @@ def main():
             backend.name,
             args.initial_state,
             args.mode,             # "population" or "bloch"
+            args.qubit,
             args.num_points,
             args.gates_per_point,
             args.shots,
