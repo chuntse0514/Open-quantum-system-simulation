@@ -243,7 +243,7 @@ def make_paths(
         <mode>-np<num_points>-gpp<gpp>-YYYY-MM-DDThh-mm-ss.<ext>
     """
     stamp  = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    folder = Path("results") / backend / f"init{init_state}"
+    folder = Path("results/idle") / backend / f"init{init_state}"
     folder.mkdir(parents=True, exist_ok=True)
     name   = f"{mode}-q{qubit}-np{num_points}-gpp{gpp}-s{shots}-{stamp}{ext}"
     return folder / name
@@ -358,7 +358,11 @@ def main():
     # ------------------------------------------------------------------
     else:
         backend = init_service(token, args.backend)
-        pm = generate_preset_pass_manager(target=backend.target, optimization_level=0)
+        pm = generate_preset_pass_manager(
+            target=backend.target, 
+            initial_layout=[args.qubit],
+            optimization_level=0
+        )
         sampler = Sampler(backend)
         max_batch = backend.configuration().max_experiments
         png_path = make_paths(

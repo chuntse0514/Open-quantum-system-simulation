@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import List, Optional
 
 def collect_csv_files(
+    method: str,
     mode: str,
     backend: Optional[str] = None,
-    init_state: Optional[str] = None,
-    qubit: Optional[int] = None,
+    init_state: Optional[str | List[str]] = None,
+    qubit: Optional[int | List[int]] = None,
     num_points: Optional[int] = None,
     gates_per_point: Optional[int] = None,
     shots: Optional[int] = None,
@@ -27,6 +28,8 @@ def collect_csv_files(
 
     Parameters
     ----------
+    method: str
+        'idle' or 'crosstalk'
     mode : str
         'population' or 'bloch'
     backend : str, optional
@@ -51,7 +54,7 @@ def collect_csv_files(
     results_root = project_root / "results"
 
     if backend:
-        results_root = results_root / backend
+        results_root = results_root / method / backend
     if init_state:
         results_root = results_root / f"init{init_state}"
 
