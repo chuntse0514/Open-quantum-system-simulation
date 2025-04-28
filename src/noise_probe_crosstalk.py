@@ -164,21 +164,30 @@ def run_batches(
 #  Population-decay analysis
 # --------------------------------------------------------------------------
 def analyse_population(
-    results, shots: int, num_points: int, gates_per_point: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    rho00 = []
+    results, shots: int, num_points: int, gates_per_point: int, id_duration_us: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return time steps, mean ground-state probability, and sample standard deviation."""
+    p0_means = []
+    p0_stds  = []
+
     for res in results:
-        counts = res.data.c.get_counts()
-        p0 = counts.get("0", 0) / shots
-        rho00.append(p0)
-    time_steps = np.arange(0, num_points) * gates_per_point
-    return time_steps, np.array(rho00)
+        counts = res.data.meas.get_counts()
+        p0_count = counts.get("0", 0)
+        p0_prob  = p0_count / shots
+        # Approximate binomial uncertainty √(p(1-p)/N)
+        std = np.sqrt(p0_prob * (1 - p0_prob) / shots)
+
+        p0_means.append(p0_prob)
+        p0_stds.append(std)
+
+    time_steps_us = np.arange(0, num_points) * gates_per_point * id_duration_us * 1e6
+    return time_steps_us, np.array(p0_means), np.array(p0_stds)
 
 
-def save_population_plot(t, rho00, out_png: Path):
+def save_population_plot(t, rho00, rho00_stds, out_png: Path):
     plt.figure()
-    plt.plot(t, rho00, "o-")
-    plt.xlabel("Identity-gate count")
+    plt.errorbar(t, rho00, yerr=rho00_stds, fmt="o-", capsize=3)
+    plt.xlabel("t $(\\mu s)$")
     plt.ylabel("$\\rho_{00}$")
     plt.title("Ground-state population vs idle time")
     plt.grid(True)
@@ -190,31 +199,51 @@ def save_population_plot(t, rho00, out_png: Path):
 #  Bloch-vector analysis
 # --------------------------------------------------------------------------
 def analyse_bloch(
-    results, shots: int, num_points: int, gates_per_point: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    results, shots: int, num_points: int, gates_per_point: int, id_duration_us: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return time steps, Bloch components (X,Y,Z) and their sample standard deviations."""
     bx, by, bz = [], [], []
-    print(len(results))
+    sx, sy, sz = [], [], []  # standard deviations
+
     for i in range(num_points):
-        bloch: Dict[str, float] = {}
+        bloch_means: Dict[str, float] = {}
+        bloch_stds: Dict[str, float]  = {}
         for j, basis in enumerate(("X", "Y", "Z")):
             counts = results[i * 3 + j].data.c.get_counts()
             p0 = counts.get("0", 0)
             p1 = counts.get("1", 0)
-            bloch[basis] = (p0 - p1) / shots
-        bx.append(bloch["X"])
-        by.append(bloch["Y"])
-        bz.append(bloch["Z"])
-    t = np.arange(0, num_points) * gates_per_point
-    return t, np.array(bx), np.array(by), np.array(bz)
+
+            total = p0 + p1
+            if total == 0:
+                bloch_means[basis] = 0
+                bloch_stds[basis] = 0
+                continue
+
+            exp = (p0 - p1) / total
+            var = (1 - exp**2) / shots  # variance of expectation value estimator
+            std = np.sqrt(var)
+
+            bloch_means[basis] = exp
+            bloch_stds[basis] = std
+
+        bx.append(bloch_means["X"])
+        by.append(bloch_means["Y"])
+        bz.append(bloch_means["Z"])
+        sx.append(bloch_stds["X"])
+        sy.append(bloch_stds["Y"])
+        sz.append(bloch_stds["Z"])
+
+    t_us = np.arange(0, num_points) * gates_per_point * id_duration_us * 1e6
+    return t_us, np.array(bx), np.array(by), np.array(bz), np.array(sx), np.array(sy), np.array(sz)
 
 
-def save_bloch_plot(t, bx, by, bz, out_png: Path):
+def save_bloch_plot(t_us, bx, by, bz, sx, sy, sz, out_png: Path):
     plt.figure(figsize=(10, 5))
-    plt.plot(t, bx, "o-", label="$⟨X⟩$")
-    plt.plot(t, by, "s-", label="$⟨Y⟩$")
-    plt.plot(t, bz, "^-", label="$⟨Z⟩$")
-    plt.xlabel("Identity-gate count")
-    plt.ylabel("Bloch component")
+    plt.errorbar(t_us, bx, yerr=sx, fmt="o-", capsize=3, label="$\\langle X\\rangle$")
+    plt.errorbar(t_us, by, yerr=sy, fmt="s-", capsize=3, label="$\\langle Y\\rangle$")
+    plt.errorbar(t_us, bz, yerr=sz, fmt="^-", capsize=3, label="$\\langle Z\\rangle$")
+    plt.xlabel("t $(\\mu s)$")
+    plt.ylabel("Bloch vectors")
     plt.title("Bloch vector vs idle time")
     plt.legend()
     plt.grid(True)
@@ -264,8 +293,8 @@ def main():
         "backend":         ("-b",   "--backend",         str, None),
         "qubit":           ("-q",   "--qubit",           str, "0"), 
         "num_points":      ("-np",  "--num-points",      int, 50),
-        "gates_per_point": ("-gpp", "--gates-per-point", int, 100),
-        "shots":           ("-s",   "--shots",           int, 8192),
+        "gates_per_point": ("-gpp", "--gates-per-point", int, 50),
+        "shots":           ("-s",   "--shots",           int, 1024),
     }
 
     pop = sub.add_parser("population", help="T1-style population decay")
@@ -344,28 +373,31 @@ def main():
             args.num_points = len(results)
         else:  # bloch : 3 results per time step
             args.num_points = len(results) // 3
-            
+        
+        backend = service.backend(backend_name)
+        id_duration_us = backend.target["id"][(0,)].duration
+        
         if args.mode == "population":
-            t, rho00 = analyse_population(
-                results, args.shots, args.num_points, args.gates_per_point
+            t_us, rho00_means, rho00_stds = analyse_population(
+                results, args.shots, args.num_points, args.gates_per_point, id_duration_us
             )
-            save_population_plot(t, rho00, png_path)
+            save_population_plot(t_us, rho00_means, rho00_stds, png_path)
             write_csv(
-                csv_path, 
-                ["id_gates", "rho00"], 
-                zip(t, rho00),
+                csv_path,
+                ["t_us", "rho00_mean", "rho00_std"],
+                zip(t_us, rho00_means, rho00_stds),
             )
             print(f"Saved → {png_path}  and  {csv_path}")
             
         elif args.mode == "bloch":
-            t, bx, by, bz = analyse_bloch(
-                results, args.shots, args.num_points, args.gates_per_point
+            t_us, bx, by, bz, sx, sy, sz = analyse_bloch(
+                results, args.shots, args.num_points, args.gates_per_point, id_duration_us
             )
-            save_bloch_plot(t, bx, by, bz, png_path)
+            save_bloch_plot(t_us, bx, by, bz, sx, sy, sz, png_path)
             write_csv(
                 csv_path,
-                ["id_gates", "X", "Y", "Z"],
-                zip(t, bx, by, bz),
+                ["t_us", "X_mean", "Y_mean", "Z_mean", "X_std", "Y_std", "Z_std"],
+                zip(t_us, bx, by, bz, sx, sy, sz),
             )
             print(f"Saved → {png_path}  and  {csv_path}")
     
@@ -393,16 +425,22 @@ def main():
         )
         csv_path = png_path.with_suffix(".csv")
         
+        id_duration_us = backend.target["id"][(0,)].duration
+        
         if args.mode == "population":
             circuits = build_population_circuits(
                 args.qubit, args.initial_state, args.num_points, args.gates_per_point, pm,
             )
             results = run_batches(sampler, circuits, args.shots, max_batch)
-            t, rho00 = analyse_population(
-                results, args.shots, args.num_points, args.gates_per_point
+            t_us, rho00_means, rho00_stds = analyse_population(
+                results, args.shots, args.num_points, args.gates_per_point, id_duration_us
             )
-            save_population_plot(t, rho00, png_path)
-            write_csv(csv_path, ["id_gates", "rho00"], zip(t, rho00))
+            save_population_plot(t_us, rho00_means, rho00_stds, png_path)
+            write_csv(
+                csv_path,
+                ["t_us", "rho00_mean", "rho00_std"],
+                zip(t_us, rho00_means, rho00_stds),
+            )
             print(f"Saved → {png_path}  and  {csv_path}")
 
         elif args.mode == "bloch":
@@ -410,11 +448,15 @@ def main():
                 args.qubit, args.initial_state, args.num_points, args.gates_per_point, pm,
             )
             results = run_batches(sampler, circuits, args.shots, max_batch)
-            t, bx, by, bz = analyse_bloch(
-                results, args.shots, args.num_points, args.gates_per_point
+            t_us, bx, by, bz, sx, sy, sz = analyse_bloch(
+                results, args.shots, args.num_points, args.gates_per_point, id_duration_us
             )
-            save_bloch_plot(t, bx, by, bz, png_path)
-            write_csv(csv_path, ["id_gates", "X", "Y", "Z"], zip(t, bx, by, bz))
+            save_bloch_plot(t_us, bx, by, bz, sx, sy, sz, png_path)
+            write_csv(
+                csv_path,
+                ["t_us", "X_mean", "Y_mean", "Z_mean", "X_std", "Y_std", "Z_std"],
+                zip(t_us, bx, by, bz, sx, sy, sz),
+            )
             print(f"Saved → {png_path}  and  {csv_path}")
         
 
