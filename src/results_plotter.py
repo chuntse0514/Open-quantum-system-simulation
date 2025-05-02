@@ -1,10 +1,11 @@
 import matplotlib.pyplot as plt
+import seaborn as sns
 plt.rcParams['mathtext.fontset'] = 'stix'
 plt.rcParams['font.family'] = 'serif'
 plt.rcParams['font.size'] = 12
 import pandas as pd
 from pathlib import Path
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Callable
 import numpy as np
 
 DF = Union[pd.DataFrame, List[pd.DataFrame]]
@@ -85,6 +86,7 @@ def plot_population(
     sharex: bool = True,
     save: bool = False,
     ncols: int = 2,
+    **kwargs
 ) -> None:
     """Plot ρ₀₀ (or Z) vs idle time."""
     dfs = [pd.read_csv(fp) for fp in file_paths]
@@ -96,11 +98,12 @@ def plot_population(
     axes = np.atleast_1d(axes).ravel()
 
     for ax, df, fp in zip(axes, dfs, file_paths):
-        x = df.iloc[:, 0]
-        y = df.iloc[:, -1]
-        ax.plot(x, y, "o-")
+        x = df["t_us"]
+        y = df["rho00_mean"]
+        y_std = df["rho00_std"]
+        ax.errorbar(x, y, yerr=y_std, fmt="o-", capsize=3, **kwargs)
         ax.set_ylabel(df.columns[-1])
-        ax.set_xlabel(df.columns[0])
+        ax.set_xlabel("t $(\\mu s)$")
         ax.set_ylim([0, 1])
         ax.set_title(_prettify_title(fp))
         ax.grid(True)
@@ -117,6 +120,7 @@ def plot_bloch(
     sharex: bool = True,
     save: bool = False,
     ncols: int = 2,
+    **kwargs
 ) -> None:
     """Plot ⟨X⟩, ⟨Y⟩, ⟨Z⟩ vs idle time."""
     dfs = [pd.read_csv(fp) for fp in file_paths]
@@ -127,13 +131,13 @@ def plot_bloch(
     fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 4 * nrows), sharex=sharex)
     axes = np.atleast_1d(axes).ravel()
 
-    markers = {"X": "o-", "Y": "s-", "Z": "^-"}
+    markers = {"X_mean": "o-", "Y_mean": "s-", "Z_mean": "^-"}
+    stds = ["X_std", "Y_std", "Z_std"]
     for ax, df, fp in zip(axes, dfs, file_paths):
         x = df.iloc[:, 0]
-        for comp, m in markers.items():
-            if comp in df.columns:
-                ax.plot(x, df[comp], m, label=f"⟨{comp}⟩")
-        ax.set_xlabel(df.columns[0])
+        for (mean, marker), std in zip(markers.items(), stds):
+            ax.errorbar(x, df[mean], yerr=df[std], fmt=marker, label=f"$\\langle {mean[0]}\\rangle$", capsize=3, **kwargs)
+        ax.set_xlabel("t $(\\mu s)$")
         ax.set_ylabel("Bloch vectors")
         ax.set_title(_prettify_title(fp))
         ax.set_ylim([-1.0, 1.0])
@@ -183,18 +187,18 @@ def plot_fidelity(
     axes = np.atleast_1d(axes).ravel()
 
     for ax, df, fp in zip(axes, dfs, file_paths):
-        if not {"X", "Y", "Z"}.issubset(df.columns):
+        if not {"X_mean", "Y_mean", "Z_mean"}.issubset(df.columns):
             raise ValueError("CSV must contain X, Y, Z columns")
 
         t = df.iloc[:, 0].to_numpy()
-        bloch = df[["X", "Y", "Z"]].to_numpy()
+        bloch = df[["X_mean", "Y_mean", "Z_mean"]].to_numpy()
 
         rho = 0.5 * (np.eye(2) + (bloch @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
         F = np.abs(np.einsum("tij,ji->t", rho, proj))
 
         ax.plot(t, F, "o-")
         ax.set_ylabel("Fidelity")
-        ax.set_xlabel(df.columns[0])
+        ax.set_xlabel("t $(\\mu s)$")
         ax.set_ylim([0.0, 1.0])
         ax.set_title(_prettify_title(fp))
         ax.grid(True)
@@ -229,18 +233,18 @@ def plot_purity(
     axes = np.atleast_1d(axes).ravel()
 
     for ax, df, fp in zip(axes, dfs, file_paths):
-        if not {"X", "Y", "Z"}.issubset(df.columns):
+        if not {"X_mean", "Y_mean", "Z_mean"}.issubset(df.columns):
             raise ValueError("CSV must contain X, Y, Z columns")
 
         t = df.iloc[:, 0].to_numpy()
-        bloch = df[["X", "Y", "Z"]].to_numpy()
+        bloch = df[["X_mean", "Y_mean", "Z_mean"]].to_numpy()
 
         rho = 0.5 * (np.eye(2) + (bloch @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
         purity = np.trace(np.einsum("...ij,...jk->...ik", rho, rho), axis1=-2, axis2=-1).real
 
         ax.plot(t, purity, "o-")
         ax.set_ylabel("Purity")
-        ax.set_xlabel(df.columns[0])
+        ax.set_xlabel("t $(\\mu s)$")
         ax.set_ylim([0.0, 1.0])
         ax.set_title(_prettify_title(fp))
         ax.grid(True)
@@ -248,7 +252,134 @@ def plot_purity(
     fig.suptitle(f"Purity for $|{init_state}\\rangle$ vs Idle Time", fontsize=16)
     _hide_extra_axes(axes, n)
     _finalise(fig, file_paths, save)
+    
+def plot_trace_distance(
+    file_paths_1: List[Path],
+    file_paths_2: List[Path],
+    init_states: List[str],
+    sharex: bool = False,
+    save: bool = False,
+    ncols: int = 2,
+    **kwargs
+) -> None:
+    
+    assert len(file_paths_1) == len(file_paths_2), (
+        f"The number of files are not matched, with # of file paths 1 = {len(file_paths_1)} and # of file paths 2 = {len(file_paths_2)}"
+    )
+    
+    pauli_dict = {
+        "X": np.array([[0, 1], [1, 0]]),
+        "Y": np.array([[0, -1j], [1j, 0]]),
+        "Z": np.array([[1, 0], [0, -1]]),
+    }
+    pauli_vec = np.stack([pauli_dict["X"], pauli_dict["Y"], pauli_dict["Z"]], axis=0)
 
+    df1s = [pd.read_csv(fp) for fp in file_paths_1]
+    df2s = [pd.read_csv(fp) for fp in file_paths_2]
+
+    n = len(df1s)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 4 * nrows), sharex=sharex)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, df1, df2 in zip(axes, df1s, df2s):
+        if not {"X_mean", "Y_mean", "Z_mean"}.issubset(df1.columns):
+            raise ValueError("CSV must contain X, Y, Z columns")
+        
+        if not {"X_mean", "Y_mean", "Z_mean"}.issubset(df2.columns):
+            raise ValueError("CSV must contain X, Y, Z columns")
+
+        t1 = df1.iloc[:, 0].to_numpy()
+        t2 = df2.iloc[:, 0].to_numpy()
+        
+        if not np.array_equal(t1, t2):
+            raise ValueError("The time points t1 and t2 must be the same")
+        
+        bloch1 = df1[["X_mean", "Y_mean", "Z_mean"]].to_numpy()
+        bloch2 = df2[["X_mean", "Y_mean", "Z_mean"]].to_numpy()
+
+        rho1 = 0.5 * (np.eye(2) + (bloch1 @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
+        rho2 = 0.5 * (np.eye(2) + (bloch2 @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
+        eigvals = np.linalg.eigvalsh(rho1-rho2)
+        trace_dist = 0.5 * np.sum(np.abs(eigvals), axis=-1)
+
+        ax.plot(t1, trace_dist, "o-", **kwargs)
+        ax.set_ylabel("Trace distance")
+        ax.set_xlabel("t $(\\mu s)$")
+        ax.set_ylim([0.0, 1.0])
+        ax.grid(True)
+
+    fig.suptitle(f"Trace distance for $|{init_states[0]}\\rangle$ and $|{init_states[1]}\\rangle$ vs Idle Time", fontsize=16)
+    _hide_extra_axes(axes, n)
+
+
+def plot_relative_entropy(
+    file_paths_1: List[Path],
+    file_paths_2: List[Path],
+    init_states: List[str],
+    sharex: bool = False,
+    save: bool = False,
+    ncols: int = 2,
+    **kwargs
+) -> None:
+    
+    assert len(file_paths_1) == len(file_paths_2), (
+        f"The number of files are not matched, with # of file paths 1 = {len(file_paths_1)} and # of file paths 2 = {len(file_paths_2)}"
+    )
+    
+    pauli_dict = {
+        "X": np.array([[0, 1], [1, 0]]),
+        "Y": np.array([[0, -1j], [1j, 0]]),
+        "Z": np.array([[1, 0], [0, -1]]),
+    }
+    pauli_vec = np.stack([pauli_dict["X"], pauli_dict["Y"], pauli_dict["Z"]], axis=0)
+
+    df1s = [pd.read_csv(fp) for fp in file_paths_1]
+    df2s = [pd.read_csv(fp) for fp in file_paths_2]
+
+    n = len(df1s)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 4 * nrows), sharex=sharex)
+    axes = np.atleast_1d(axes).ravel()
+    
+    def matrix_function(M: np.ndarray ,fn: Callable) -> np.ndarray:
+        eigvals, eigvecs = np.linalg.eigh(M)
+        return eigvecs @ np.stack([np.diag(fn(eigval)) for eigval in eigvals], axis=0) @ eigvecs.transpose(0, -1, -2).conj()
+
+    for ax, df1, df2 in zip(axes, df1s, df2s):
+        if not {"X_mean", "Y_mean", "Z_mean"}.issubset(df1.columns):
+            raise ValueError("CSV must contain X, Y, Z columns")
+        
+        if not {"X_mean", "Y_mean", "Z_mean"}.issubset(df2.columns):
+            raise ValueError("CSV must contain X, Y, Z columns")
+
+        t1 = df1.iloc[:, 0].to_numpy()
+        t2 = df2.iloc[:, 0].to_numpy()
+        
+        if not np.array_equal(t1, t2):
+            raise ValueError("The time points t1 and t2 must be the same")
+        
+        bloch1 = df1[["X_mean", "Y_mean", "Z_mean"]].to_numpy()
+        bloch2 = df2[["X_mean", "Y_mean", "Z_mean"]].to_numpy()
+
+        rho1 = 0.5 * (np.eye(2) + (bloch1 @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
+        rho2 = 0.5 * (np.eye(2) + (bloch2 @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
+        log_rho1 = matrix_function(rho1, np.log)
+        log_rho2 = matrix_function(rho2, np.log)
+        print(log_rho1.shape)
+        print(rho1.shape)
+        relative_entropy = np.abs(np.trace(rho1 @ (log_rho1 - log_rho2), axis1=-2, axis2=-1))
+
+        ax.plot(t1, relative_entropy, "o-", **kwargs)
+        ax.set_ylabel("Relative entropy")
+        ax.set_xlabel("t $(\\mu s)$")
+        ax.set_ylim([0.0, 1.0])
+        ax.grid(True)
+
+    fig.suptitle(f"Relative entropy for $|{init_states[0]}\\rangle$ and $|{init_states[1]}\\rangle$ vs Idle Time", fontsize=16)
+    _hide_extra_axes(axes, n)
 
 # ───────────────────────────────────────────────────── helper functions
 def _finalise(fig, file_paths: List[Path], save: bool) -> None:

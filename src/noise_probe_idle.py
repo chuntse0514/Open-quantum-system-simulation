@@ -185,6 +185,7 @@ def save_population_plot(t, rho00, rho00_stds, out_png: Path):
     plt.errorbar(t, rho00, yerr=rho00_stds, fmt="o-", capsize=3)
     plt.xlabel("t $(\\mu s)$")
     plt.ylabel("$\\rho_{00}$")
+    plt.ylim([0.0, 1.0])
     plt.title("Ground-state population vs idle time")
     plt.grid(True)
     plt.savefig(out_png, dpi=300)
@@ -240,6 +241,7 @@ def save_bloch_plot(t_us, bx, by, bz, sx, sy, sz, out_png: Path):
     plt.errorbar(t_us, bz, yerr=sz, fmt="^-", capsize=3, label="$\\langle Z\\rangle$")
     plt.xlabel("t $(\\mu s)$")
     plt.ylabel("Bloch vectors")
+    plt.ylim([-1.0, 1.0])
     plt.title("Bloch vector vs idle time")
     plt.legend()
     plt.grid(True)
@@ -272,7 +274,7 @@ def make_paths(
         <mode>-np<num_points>-gpp<gpp>-YYYY-MM-DDThh-mm-ss.<ext>
     """
     stamp  = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    folder = Path("results/idle") / backend / f"init{init_state}"
+    folder = Path("results/state_tomography/idle") / backend / f"init{init_state}"
     folder.mkdir(parents=True, exist_ok=True)
     name   = f"{mode}-q{qubit}-np{num_points}-gpp{gpp}-s{shots}-{stamp}{ext}"
     return folder / name
@@ -290,7 +292,7 @@ def main():
         "qubit":           ("-q",   "--qubit",           int, 0), 
         "num_points":      ("-np",  "--num-points",      int, 50),
         "gates_per_point": ("-gpp", "--gates-per-point", int, 50),
-        "shots":           ("-s",   "--shots",           int, 1024),
+        "shots":           ("-s",   "--shots",           int, 8192),
     }
 
     pop = sub.add_parser("population", help="T1-style population decay")
