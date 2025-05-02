@@ -106,7 +106,8 @@ def run_process_tomography(
     exp_data_list = []
     for i, idle_circuit in enumerate(idle_circuits):
         print(f"queuing job {i+1}/{num_points}")
-        qpt = ProcessTomography(idle_circuit, backend=backend, physical_qubits=qubit, measurement_indices=[0])
+        qpt = ProcessTomography(idle_circuit, backend=backend, physical_qubits=qubit, 
+                                measurement_indices=[0], preparation_indices=[0])
         exp_data_list.append(qpt.run(sampler=sampler))   # no block_for_results()
 
     # 2) now extract your Choi matrices & fidelities
@@ -158,6 +159,7 @@ def main():
     parser.add_argument("-gpp",  "--gates-per-point", type=int, default=50, help="Number of identity gates between two time points")
     parser.add_argument("-s",    "--shots",          type=int, default=8192, help="Shots per circuit")
     parser.add_argument("-init", "--initial-state",  type=str, default="+", help="Initial states of spectator qubits")
+    parser.add_argument("-t",    "--test",           action='store_true')
     args = parser.parse_args()
     if isinstance(args.qubit, str):
         args.qubit = [int(q) for q in args.qubit.replace(",", " ").split()]
@@ -179,7 +181,8 @@ def main():
     choi_matrices, channel_fidelities = run_process_tomography(
         backend, sampler, args.num_points, args.gates_per_point, args.shots, args.qubit, args.initial_state
     )
-    save_results(time_steps_us, choi_matrices, channel_fidelities, args)
+    if not args.test:
+        save_results(time_steps_us, choi_matrices, channel_fidelities, args)
 
 
 if __name__ == "__main__":
