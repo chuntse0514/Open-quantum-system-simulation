@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 def collect_csv_files(
+    tomography_type: str,
     method: str,
     mode: str,
     backend: Optional[str] = None,
@@ -29,6 +30,8 @@ def collect_csv_files(
 
     Parameters
     ----------
+    tomography_type: str
+        'state' or 'process'
     method: str
         'idle' or 'crosstalk'
     mode : str
@@ -55,7 +58,7 @@ def collect_csv_files(
     results_root = project_root / "results"
 
     if backend:
-        results_root = results_root / method / backend
+        results_root = results_root / (tomography_type + "_tomography") / method / backend
     if init_state:
         results_root = results_root / f"init{init_state}"
 
@@ -366,10 +369,9 @@ def plot_relative_entropy(
 
         rho1 = 0.5 * (np.eye(2) + (bloch1 @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
         rho2 = 0.5 * (np.eye(2) + (bloch2 @ pauli_vec.reshape(3, 4)).reshape(-1, 2, 2))
-        log_rho1 = matrix_function(rho1, np.log)
-        log_rho2 = matrix_function(rho2, np.log)
-        print(log_rho1.shape)
-        print(rho1.shape)
+        log_rho1 = matrix_function(rho1, np.log2)
+        log_rho2 = matrix_function(rho2, np.log2)
+
         relative_entropy = np.abs(np.trace(rho1 @ (log_rho1 - log_rho2), axis1=-2, axis2=-1))
 
         ax.plot(t1, relative_entropy, "o-", **kwargs)
