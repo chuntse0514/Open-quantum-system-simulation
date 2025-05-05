@@ -1,9 +1,15 @@
 import jax
 import jax.numpy as jnp
 from typing import Callable
+from pathlib import Path
+import pandas as pd
 from copy import deepcopy
 import matplotlib.pyplot as plt
 import optax 
+from .lindblad import *
+
+jax.config.update("jax_enable_x64", True)
+
 
 def inverse_laplace(N_poly_coeff: jax.Array, D_poly_coeff: jax.Array, tol=1e-7):
     r"""
@@ -19,8 +25,6 @@ def inverse_laplace(N_poly_coeff: jax.Array, D_poly_coeff: jax.Array, tol=1e-7):
     """
     
     roots = jnp.roots(D_poly_coeff)
-    print(roots)
-
     # sort to make grouping reproducible
     roots_sorted = roots[jnp.argsort(roots.real)]
     
@@ -59,9 +63,11 @@ def inverse_laplace(N_poly_coeff: jax.Array, D_poly_coeff: jax.Array, tol=1e-7):
         
         D_bar_poly_coeff = deepcopy(clusters)
         D_bar_poly_coeff.pop(index)
-        D_bar_poly_coeff = jnp.concat(D_bar_poly_coeff)
-
-        G = lambda s: jnp.polyval(N_poly_coeff, s) / jnp.polyval(D_bar_poly_coeff, s)
+        if len(D_bar_poly_coeff) > 0:
+            D_bar_poly_coeff = jnp.poly(jnp.concat(D_bar_poly_coeff))
+            G = lambda s: jnp.polyval(N_poly_coeff, s) / jnp.polyval(D_bar_poly_coeff, s)
+        else:
+            G = lambda s: jnp.polyval(N_poly_coeff, s)
         
         n_order_grads = make_n_order_grads(G, order=m-1)
 
@@ -89,7 +95,7 @@ def inverse_laplace(N_poly_coeff: jax.Array, D_poly_coeff: jax.Array, tol=1e-7):
     return f                                # differentiable JAX‑Callable
 
 
-def make_xi_i_of_t(a: jax.Array, b:jax.Array, lambda_i: float, tol=1e-7):
+def xi_pmme(t: jax.Array, a: jax.Array, b: jax.Array, λ: jax.Array, tol=1e-7):
     r"""
     Assuming that the memory kernel is s domain has the following functional form:
         $\tilde{k}(s) = P(s) / Q(s)$
@@ -103,42 +109,131 @@ def make_xi_i_of_t(a: jax.Array, b:jax.Array, lambda_i: float, tol=1e-7):
     Define 
         $D(s) = sQ(s-\lambda_i) - \lambda_i P(s-\lambda_i)$
     """
-    
-    assert bool(jnp.all(b.real < 0)), (
-        "The real part of b must be all less than 0 to ensure the stability!"
-    ) 
 
-    # ---------------- P(s-λ_i), Q(s-λ_i) -----------------------------------------
-    P_poly_coeff = jnp.poly(a + lambda_i)   # P(s-\lambda_i)
-    Q_poly_coeff = jnp.poly(b + lambda_i)   # Q(s-\lambda_i)
+    ξ = []
+    for λi in λ:
+        # ---------------- P(s-λ_i), Q(s-λ_i) -----------------------------------------
+        
+        P_poly_coeff = jnp.poly(a + λi)   # P(s-\lambda_i)
+        Q_poly_coeff = jnp.poly(b + λi)   # Q(s-\lambda_i)
+        
+        if len(a) == 0:
+            P_poly_coeff = jnp.array([P_poly_coeff])
+        
+        # D(s) = s Q(s-λ_i) - λ_i P(s-λ_i)
+        sQ = jnp.concat([Q_poly_coeff, jnp.zeros(1, Q_poly_coeff.dtype)])
+        D_poly_coeff = jnp.polysub(sQ, λi * P_poly_coeff)
+        N_poly_coeff = Q_poly_coeff
     
-    # D(s) = s Q(s-λ_i) - λ_i P(s-λ_i)
-    sQ = jnp.concat([Q_poly_coeff, jnp.zeros(1, Q_poly_coeff.dtype)])
-    D_poly_coeff = jnp.polysub(sQ, lambda_i * P_poly_coeff)
-    N_poly_coeff = Q_poly_coeff
-    
-    return inverse_laplace(N_poly_coeff, D_poly_coeff)
+        ξ.append(inverse_laplace(N_poly_coeff, D_poly_coeff)(t))
+        
+    return jnp.stack(ξ, axis=0)
 
+def rho_pmme(μ):
     
+    # left eigen‑operators
+    R = jnp.array([(I2 + σz)/jnp.sqrt(2), σz/jnp.sqrt(2), σm, σp])
+
+    rho = jnp.einsum("ij,i...->j...", μ, R)
+    return rho
+
+def fit_kernel(csv_path: str | Path,
+               n_zeros: int,
+               n_poles: int,
+               lr: float = 1e-2,
+               steps: int = 2000,
+               seed: int = 0,
+               plot_result: bool = False):
+    
+    assert n_poles > n_zeros, ("Number of poles needs to larger than number of zeros!")
+    
+    # ---------- get Markov parameters first -------------------------------
+    ω0, γpd0, γad0 = fit_lindblad(csv_path, steps=3000, lr=3e-3, seed=seed)
+
+    # ---------- load experiment -------------------------------------------
+    df   = pd.read_csv(csv_path)
+    t_exp = df.iloc[:,0].to_numpy()
+    bloch_exp = df[["X_mean","Y_mean","Z_mean"]].to_numpy()
+    ρ_exp  = 0.5*(I2 + jnp.tensordot(bloch_exp, pauli_stack, axes=1))
+    μ_exp= rho_to_mu(ρ_exp)                                  # (4,T)
+
+    tag  = csv_path.split("/")[4][4:].split(",")[0]
+    ρ0   = dm_init[tag]
+    μ0   = rho_to_mu(ρ0[None, :, :])[...,0]                    # (4,)
+
+    # ---------- parameter vector initialisation ---------------------------
+    key  = jax.random.PRNGKey(seed)
+    subkeys = jax.random.split(key, num=4)
+    # a0 = jnp.array(jax.random.exponential(key=subkeys[0], shape=(n_zeros,)), dtype=jnp.complex128)
+    # b0 = -jnp.array(jax.random.exponential(key=subkeys[1], shape=(n_poles,)), dtype=jnp.complex128)
+    a0 = 0.1 * jax.random.normal(key=subkeys[0], shape=(n_zeros,))
+    b0 = 1 * jax.random.normal(key=subkeys[1], shape=(n_poles,))
+    # a0i = 0.25 * jax.random.normal(key=subkeys[2], shape=(n_zeros // 2,))
+    # b0i = 1 * jax.random.normal(key=subkeys[3], shape=(n_zeros // 2,))
+    # θ0   = {"a": a0, "b": b0, "ω": ω0, "γpd": γpd0, "γad": γad0}   
+    θ0   = {"a": a0, "b": b0}   
+    
+    # print("θ0 = ", θ0)
+    
+    # ξ_t = xi_pmme(t_exp, a0, b0, c0, λ) # (4, T)
+    λ = jnp.array([0,
+                -γad0,
+                1j*ω0 - 2*γpd0 - 0.5*γad0,
+                -1j*ω0 - 2*γpd0 - 0.5*γad0], dtype=jnp.complex128)
+    
+    
+    def loss_kernel(params): 
+        a = params["a"]
+        b = params["b"]
+        
+        ξ_t = xi_pmme(t_exp, -a**2, -b**2, λ) # (4, T)
+        μ_t = μ0[:, None] * ξ_t
+
+        return jnp.mean(jnp.abs(μ_t - μ_exp)**2)# real concat
+
+    loss  = lambda θ: loss_kernel(θ)
+
+    opt   = optax.adam(lr)
+    state = opt.init(θ0)
+    θ     = θ0
+
+    def step(θ, state):
+        l, g = jax.value_and_grad(loss)(θ)
+        upd, state = opt.update(g, state)
+        θ = optax.apply_updates(θ, upd)
+        return θ, state, l
+
+    for k in range(steps):
+        θ, state, L = step(θ, state)
+        if k % 10 == 0:
+            print(f"it {k:4d}  loss={L:.3e}")
+
+    print("Solved a = ", -θ["a"] ** 2)
+    print("Solved b = ", -θ["b"] ** 2)
+    print("Final loss:", float(L))
+    
+    if plot_result:
+        a, b = θ.values()
+        
+        ξ_t = xi_pmme(t_exp, -a**2, -b**2, λ) # (4, T)
+        μ_t = μ0[:, None] * ξ_t
+        rho = rho_pmme(μ_t)
+        bloch = rho_to_bloch(rho)
+        
+        for i, pauli in enumerate(["X", "Y", "Z"]):
+            plt.plot(t_exp, bloch[i], label=f"PMME-{pauli}")
+        for i, pauli in enumerate(["X", "Y", "Z"]):
+            plt.plot(t_exp, bloch_exp[:, i], ls="", marker="x", label=f"Exp-{pauli}")
+
+        plt.legend()
+        plt.show()
+    
+    
+    return θ
     
 if __name__ == "__main__":
     
-    a = jnp.array([1, 4])
-    b = jnp.array([-2, -1, -4])
-    xi = make_xi_i_of_t(a, b, 1+2j)
-    
-    # P_poly_coeff = jnp.poly(a)   # P(s-\lambda_i)
-    # Q_poly_coeff = jnp.poly(b)   # Q(s-\lambda_i)
-    
-    # memory_kernel = inverse_laplace(P_poly_coeff, Q_poly_coeff)
-    
-    t = jnp.linspace(0, 5, 100)
-    xi_val = xi(t)
-    # k_val = memory_kernel(t)
-    
-    plt.plot(t, xi_val.real, label="real")
-    plt.plot(t, xi_val.imag, label="imag")
-    plt.legend()
-    plt.show()
+    csv_path = file = "results/state_tomography/crosstalk/ibm_strasbourg/init-,+,+,+/bloch-q[64, 63, 65, 54]-np50-gpp50-s8192-2025-04-28T23-14-04.csv"
+    θ_opt = fit_kernel(csv_path, n_zeros=1, n_poles=5, steps=500, lr=1e-2, plot_result=True)
     
 
