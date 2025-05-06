@@ -69,10 +69,17 @@ def mu_markov(t, θ, ρ0):
     expλt = jnp.exp(λ[:, None] * t[None, :])            # (4,T)
     return μ0 * expλt
 
-def rho_to_mu(ρt):
+def rho_to_mu(ρ_t):
     
     L = jnp.array([I2/jnp.sqrt(2), (σz - I2)/jnp.sqrt(2), σp, σm])
-    return jnp.trace(L[:, None, :, :] @ ρt[None, :, :, :], axis1=-2, axis2=-1) # (4, T)
+    return jnp.trace(L[:, None, :, :] @ ρ_t[None, :, :, :], axis1=-2, axis2=-1) # (4, T)
+
+def mu_to_rho(μ_t):
+    
+    # right eigen‑operators
+    R = jnp.array([(I2 + σz)/jnp.sqrt(2), σz/jnp.sqrt(2), σm, σp])
+    rho = jnp.einsum("ij,i...->j...", μ_t, R)
+    return rho
 
 def rho_to_bloch(ρt):
     
@@ -88,11 +95,7 @@ def fit_lindblad(csv_path: str | Path,
     # ------- load experiment -----------------------------------------------
     df     = pd.read_csv(csv_path)
     t_exp  = df.iloc[:, 0].to_numpy()                       # (T,)
-    bloch  = df[["X_mean", "Y_mean", "Z_mean"]].to_numpy()  # (T,3)
-
-    # density matrices from Bloch vectors
-    ρ_exp  = 0.5 * (I2 + jnp.tensordot(bloch, pauli_stack, axes=1))  # (T,2,2)
-    μ_t_exp = rho_to_mu(ρ_exp)
+    bloch_exp = jnp.array(df[["X_mean","Y_mean","Z_mean"]].to_numpy()).swapaxes(-1, -2) # (3, T)
 
     # initial state from filename "init=..."
     tag    = csv_path.split("/")[4][4:].split(",")[0]
@@ -106,7 +109,9 @@ def fit_lindblad(csv_path: str | Path,
     # ------- loss -----------------------------------------------------------
     def loss_fn(params):
         μ_t = mu_markov(t_exp, params, ρ0)
-        return jnp.mean(jnp.abs(μ_t - μ_t_exp) ** 2)
+        ρ_t = mu_to_rho(μ_t)
+        bloch = rho_to_bloch(ρ_t)
+        return jnp.mean(jnp.abs(bloch - bloch_exp) ** 2)
 
     # ------- optimiser loop -------------------------------------------------
     opt    = optax.adam(lr)
@@ -143,7 +148,7 @@ def fit_lindblad(csv_path: str | Path,
         for i, pauli in enumerate(["X", "Y", "Z"]):
             plt.plot(t_exp, bloch_fit[i], color=colors[i], label=f"Lindblad-${pauli}$")
         for i, pauli in enumerate(["X", "Y", "Z"]):
-            plt.plot(t_exp, bloch[:, i], ls="", marker=markers[i], color=colors[i], label=f"Exp-${pauli}$")
+            plt.plot(t_exp, bloch_exp[i], ls="", marker=markers[i], color=colors[i], label=f"Exp-${pauli}$")
         plt.ylim([-1.0, 1.0])
         plt.xlabel("t $(\\mu s)$")
         plt.ylabel("Bloch vectors")
