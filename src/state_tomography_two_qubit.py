@@ -109,7 +109,30 @@ def make_paths(
     name   = f"q{qubit}-np{num_points}-gpp{gpp}-s{shots}-{stamp}{ext}"
     return folder / name    
 
-
+def retrieve_from_job_id(job_id_list: List[str]):
+    token = os.getenv("IBM_TOKEN")
+    service = QiskitRuntimeService(channel="ibm_quantum", token=token)
+    results = []
+    for job_id in job_id_list:
+        job = service.job(job_id)
+        results.extend(job.result())
+        backend_name = job.backend().name
+        print(f"Fetching remote job '{job.job_id()}' from backend {backend_name} (status={job.status()})")
+    return results
+    
+def retrieve_from_file_name(file: str):
+    
+    print(f"Loading data from {file} ...")
+    
+    with np.load(file) as data:
+        # List the stored arrays
+        print("Keys  :", data.files)      # -> ['time_us', 'coherent_vec_mean', 'coherent_vec_std']
+        # shape (T,)
+        coherent_vec_mean  = data["coherent_vec_mean"]  # shape (T, 15)
+        coherent_vec_std   = data["coherent_vec_std"]   # shape (T, 15)
+        
+    return coherent_vec_mean, coherent_vec_std
+    
 def save_results(time_steps_us: np.ndarray, coherent_vec_mean: List[np.ndarray], coherent_vec_std: List[float], args):
     # Determine output path
     # Build the base path (no extension here)
@@ -152,7 +175,7 @@ def save_png(time_steps_us, mutual_information, args):
     )
     
     plt.plot(time_steps_us, mutual_information, color="#ff9999", marker="x", ls="-.")
-    plt.ylim([0.0, 1.0])
+    plt.ylim([0.0, 2.0])
     plt.xlabel("t $(\\mu s)$")
     plt.ylabel("$I(A:B)_{\\rho}$")
     plt.title("evolution of mutual information over time")
@@ -176,33 +199,51 @@ def run_state_tomography(
     return results
 
 
-def analyse_result(
-    results, shots: int, num_points: int,
-):
-    coherent_vec_mean = []
-    coherent_vec_std = []
+def analyse_result(results, shots: int, num_points: int):
     
-    for i in range(num_points):
-        means = []
-        stds = []
-        for j, pauli_string in enumerate(pauli_strings):
-            counts = results[i * 15 + j].data.meas.get_counts()
-            bits = counts.keys()
-            values = counts.values()
-            signs = [1 if bit[0] == bit[1] else -1 for bit in bits]
-            exp = np.sum([value * sign for value, sign in zip(values, signs)]) / shots
-            var = np.sum([value * (sign - exp) ** 2 for value, sign in zip(values, signs)]) / shots
-            std = np.sqrt(var)
-            
+    def pauli_sign(pstr: str, bitstr: str) -> int:
+        """
+        Eigen‑value (±1) of a two‑qubit Pauli string `pstr` when computational
+        basis result `bitstr` ('00', '01', …) is obtained *after* the usual
+        basis‑change rotations.
+        I ⟶ always +1
+        X,Y,Z ⟶ +1 if the qubit outcome is '0', −1 if '1'
+        """
+        s = 1
+        for p, b in zip(pstr, bitstr[::-1]):
+            if p != "I" and b == "1":
+                s *= -1
+        return s
+    
+    """Return mean and std arrays, shape (T, 15)."""
+    means_all, stds_all = [], []
+
+    for t in range(num_points):
+        means, stds = [], []
+
+        for j, P in enumerate(pauli_strings):
+            cnts = results[t*15 + j].data.meas.get_counts()
+
+            # convert once to arrays ------------------------------
+            bitstrs = np.array(list(cnts.keys()))
+            counts  = np.array(list(cnts.values()), dtype=float)
+            probs   = counts / shots
+
+            # eigen‑values and statistics -------------------------
+            signs = np.array([pauli_sign(P, b) for b in bitstrs], dtype=float)
+            exp   = np.sum(probs * signs)
+            var   = np.sum(probs * (signs - exp)**2)
+            std   = np.sqrt(var)
+
             means.append(exp)
             stds.append(std)
-            
-        # rho = I / 4 + v \cdot F
-        # F = \sigma_i \otimes \sigma_j / 2
-        coherent_vec_mean.append(np.array(means) / 2) # (T, 15)
-        coherent_vec_std.append(np.array(stds) / 2)   # (T, 15)
-    
-    return np.array(coherent_vec_mean), np.array(coherent_vec_std)
+
+        # store one time‑slice -----------------------------------
+        means_all.append(np.asarray(means) / 2)   # divide by 2 → v_k = ⟨σ⟩/2
+        stds_all .append(np.asarray(stds)  / 2)
+
+    return np.asarray(means_all), np.asarray(stds_all)
+
 
 
 def reconstruct_density_matrix(coherent_vec_batch):
@@ -211,9 +252,16 @@ def reconstruct_density_matrix(coherent_vec_batch):
     rho = rho + np.tensordot(coherent_vec_batch, pauli_stack, axes=[[1,], [0,]]) / 2
     return rho
 
-def matrix_function(M: np.ndarray ,fn: Callable) -> np.ndarray:
-    eigvals, eigvecs = np.linalg.eigh(M)
-    return eigvecs @ np.stack([np.diag(fn(eigval)) for eigval in eigvals], axis=0) @ eigvecs.transpose(0, -1, -2).conj()
+def matrix_function(rho, fn, eps=1e-12):
+    # rho: (B, d, d)
+    eigvals, eigvecs = np.linalg.eigh(rho)  # batch‑eigh 
+    print(eigvals)
+    eigvals = np.clip(eigvals, eps, None)   # avoid log(0)                    # natural or base‑2 log
+    # diag‑embed
+    D = np.zeros_like(rho)
+    idx = np.arange(rho.shape[-1])
+    D[..., idx, idx] = fn(eigvals)
+    return eigvecs @ D @ eigvecs.conj().transpose(0, 2, 1)
 
 def quantum_relative_entropy(rho1, rho2):
     log_rho1 = matrix_function(rho1, np.log2)
@@ -223,7 +271,8 @@ def quantum_relative_entropy(rho1, rho2):
     return relative_entropy
     
 def quantum_mutual_informaion(density_matrix_batch):
-    
+    density_matrix_batch = matrix_function(density_matrix_batch, np.abs)
+    density_matrix_batch = density_matrix_batch / np.trace(density_matrix_batch, axis1=-2, axis2=-1)
     rhoA = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=1, axis2=3)
     rhoB = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=2, axis2=4)
     rhoA_tensor_rhoB = np.stack([np.kron(rho1, rho2) for rho1, rho2 in zip(rhoA, rhoB)], axis=0)
@@ -241,13 +290,17 @@ def main():
     parser.add_argument("-init", "--initial-state",  type=str, default="+", help="Initial states of spectator qubits")
     parser.add_argument("-t",    "--test",           action='store_true')
     parser.add_argument("-id",   "--job-id",         type=str, default=None, help="Job-ID for job retreival")
+    parser.add_argument("-f",    "--file-name",      type=str, default=None, help="File name for plotting the results")
     args = parser.parse_args()
     if isinstance(args.qubit, str):
         args.qubit = [int(q) for q in args.qubit.replace(",", " ").split()]
     if isinstance(args.initial_state, str):
         args.initial_state = args.initial_state.replace(",", " ").split()
     if isinstance(args.job_id, str):
-        args.job_id = args.job_id.replace(",", " ").split()
+        if "," in args.job_id:
+            args.job_id = args.job_id.replace(",", " ").split()
+        else:
+            args.job_id = [args.job_id]
         
     token = os.getenv("IBM_TOKEN")
     if not token:
@@ -267,16 +320,23 @@ def main():
     id_duration_us = backend.target["id"][(0,)].duration
     time_steps_us = np.arange(0, args.num_points) * args.gates_per_point * id_duration_us * 1e6
 
-    print(f"Running two qubit state tomography: qubit={args.qubit}, number of points={args.num_points}, gates per point={args.gates_per_point}, shots={args.shots}")
-    results = run_state_tomography(
-        backend, sampler, args.num_points, args.gates_per_point, 
-        args.shots, args.qubit, args.initial_state, pm
-    )
-    coherent_vec_mean, coherent_vec_std = analyse_result(
-        results, args.shots, args.num_points,
-    )
+    if not args.file_name and not args.job_id:
+        print(f"Running two qubit state tomography: qubit={args.qubit}, number of points={args.num_points}, gates per point={args.gates_per_point}, shots={args.shots}")
+        results = run_state_tomography(
+            backend, sampler, args.num_points, args.gates_per_point, 
+            args.shots, args.qubit, args.initial_state, pm
+        )
+    elif args.job_id:
+        results = retrieve_from_job_id(id=args.job_id)
+    elif args.file_name:
+        coherent_vec_mean, coherent_vec_std = retrieve_from_file_name(file=args.file_name)
     
-    if not args.test:
+    if not args.file_name:
+        coherent_vec_mean, coherent_vec_std = analyse_result(
+            results, args.shots, args.num_points,
+        )
+        
+    if not args.test and not args.file_name:
         save_results(time_steps_us, coherent_vec_mean, coherent_vec_std, args)
     
     density_matrix_batch = reconstruct_density_matrix(coherent_vec_mean)
