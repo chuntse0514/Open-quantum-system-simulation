@@ -11,7 +11,7 @@ from qiskit.transpiler import generate_preset_pass_manager
 from typing import List
 from itertools import product
 import matplotlib.pyplot as plt
-plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['text.usetex'] = True
 plt.rcParams['font.family'] = 'serif'
 plt.rcParams['font.size'] = 12
 
@@ -255,7 +255,6 @@ def reconstruct_density_matrix(coherent_vec_batch):
 def matrix_function(rho, fn, eps=1e-12):
     # rho: (B, d, d)
     eigvals, eigvecs = np.linalg.eigh(rho)  # batch‑eigh 
-    print(eigvals)
     eigvals = np.clip(eigvals, eps, None)   # avoid log(0)                    # natural or base‑2 log
     # diag‑embed
     D = np.zeros_like(rho)
@@ -267,14 +266,28 @@ def quantum_relative_entropy(rho1, rho2):
     log_rho1 = matrix_function(rho1, np.log2)
     log_rho2 = matrix_function(rho2, np.log2)
 
-    relative_entropy = np.abs(np.trace(rho1 @ (log_rho1 - log_rho2), axis1=-2, axis2=-1))
+    relative_entropy = np.trace(rho1 @ (log_rho1 - log_rho2), axis1=-2, axis2=-1).real
     return relative_entropy
     
-def quantum_mutual_informaion(density_matrix_batch):
+def von_neumann_entropy(rho):
+    log_rho = matrix_function(rho, np.log2)
+    entropy = -np.trace(rho @ log_rho, axis1=-2, axis2=-1).real
+    return entropy
+    
+def quantum_conditional_entropy(density_matrix_batch):
     density_matrix_batch = matrix_function(density_matrix_batch, np.abs)
-    density_matrix_batch = density_matrix_batch / np.trace(density_matrix_batch, axis1=-2, axis2=-1)
-    rhoA = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=1, axis2=3)
-    rhoB = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=2, axis2=4)
+    density_matrix_batch = density_matrix_batch / np.trace(density_matrix_batch, axis1=-2, axis2=-1)[:, None, None]
+    rhoB = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=1, axis2=3)
+    I_tensor_rhoB = np.stack([np.kron(np.eye(2), rho) for rho in rhoB], axis=0)
+    conditional_entropy = -quantum_relative_entropy(density_matrix_batch, I_tensor_rhoB)
+    
+    return conditional_entropy
+
+def quantum_mutual_information(density_matrix_batch):
+    density_matrix_batch = matrix_function(density_matrix_batch, np.abs)
+    density_matrix_batch = density_matrix_batch / np.trace(density_matrix_batch, axis1=-2, axis2=-1)[:, None, None]
+    rhoA = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=2, axis2=4)
+    rhoB = np.trace(density_matrix_batch.reshape(-1, 2, 2, 2, 2), axis1=1, axis2=3)
     rhoA_tensor_rhoB = np.stack([np.kron(rho1, rho2) for rho1, rho2 in zip(rhoA, rhoB)], axis=0)
     mutual_information = quantum_relative_entropy(density_matrix_batch, rhoA_tensor_rhoB)
     
@@ -340,7 +353,7 @@ def main():
         save_results(time_steps_us, coherent_vec_mean, coherent_vec_std, args)
     
     density_matrix_batch = reconstruct_density_matrix(coherent_vec_mean)
-    mutual_information = quantum_mutual_informaion(density_matrix_batch)
+    mutual_information = quantum_mutual_information(density_matrix_batch)
     
     if not args.test:
         save_png(time_steps_us, mutual_information, args)

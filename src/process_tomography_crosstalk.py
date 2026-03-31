@@ -56,7 +56,7 @@ def make_paths(
         <mode>-np<num_points>-gpp<gpp>-YYYY-MM-DDThh-mm-ss.<ext>
     """
     stamp  = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    folder = Path("results/process_tomography/crosstalk") / backend / initial_state
+    folder = Path("results/process_tomography/crosstalk") / backend / ("init"+initial_state)
     folder.mkdir(parents=True, exist_ok=True)
     name   = f"q{qubit}-np{num_points}-gpp{gpp}-s{shots}-{stamp}{ext}"
     return folder / name

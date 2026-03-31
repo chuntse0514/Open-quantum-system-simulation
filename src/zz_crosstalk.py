@@ -29,7 +29,7 @@ def _state_to_bloch(label: str):
     raise ValueError(f"Unknown qubit label '{label}'.")
 
 
-def parse_initial_state(path: str | Path):
+def parse_initial_state(path: str | Path, n_spec: int):
     """Extract main and spectator Bloch vectors from filename."""
     path = str(path)
     try:
@@ -38,56 +38,87 @@ def parse_initial_state(path: str | Path):
         raise RuntimeError("Filename must contain 'init<prep_string>/' segment") from e
 
     labels = init_chunk.split(",")
+    if len(labels) != n_spec + 1:
+        raise ValueError(
+            f"Expected {n_spec+1} qubit labels, found {len(labels)} in '{init_chunk}'.")
 
     # main qubit first
     x0, y0, z0 = _state_to_bloch(labels[0])
-    return jnp.asarray([x0, y0, z0], dtype=jnp.float64)
-
+    spectator_xyz = jnp.array([_state_to_bloch(l) for l in labels[1:]])  # (N,3)
+    z_spec = spectator_xyz[:, 2]                                          # (N,)
+    return jnp.asarray([x0, y0, z0], dtype=jnp.float64), z_spec
 
 # -----------------------------------------------------------------------------
 #  Analytic Σ₀⁺(t) and Bloch‑vector functions (Eq. C58)
 # -----------------------------------------------------------------------------
 
-def sigma_plus_general(t, x0, y0, ω0, Γ0):
+def sigma_plus_general(t, x0, y0, ω0, Γ0, J_0q, Γq, zq):
     """Analytic Σ₀⁺(t) for arbitrary spectator preparations.
 
     t : (T,)          time grid
     x0,y0            : main‑qubit Bloch coords in xy plane at t=0
     ω0               : detuning (rad/µs)
-    Γ0               : envelope rate (0.5γ↓+2γϕ₀)
-    """                  # broadcast (1,T)
+    Γ0               : envelope rate (½γ↓₀ + γϕ₀)
+    J_0q, Γq, zq : (N,)   : ZZ couplings, spectator decay, spectator z‑coords
+    """
+    t = t[None, :]                     # broadcast (1,T)
     Σ = 0.5 * (x0 - 1j * y0) * jnp.exp(-(Γ0 - 1j * ω0) * t)
 
-    return Σ         # (T,)
+    if J_0q.size:
+        Jq = J_0q[:, None]
+        Γq = Γq[:, None]
+        zq = zq[:, None]
+        Ωq  = Γq / 2.0 - 1j * Jq
+        eps = 1e-12
+        absΩ = jnp.abs(Ωq)
+        Cq  = jnp.cosh(Ωq * t)
+        Sq  = jnp.sinh(Ωq * t)
+        ratio = jnp.where(absΩ > eps,
+                  (Γq/2.0 - 1j*zq*Jq)/Ωq,
+                  1.0 + 0.0j)         # limit: use series (below) when needed
+        bracket = jnp.where(absΩ > eps,
+                            Cq + ratio*Sq,
+                            1.0 + (Γq/2.0 - 1j*zq*Jq)*t)   # 1st-order series
+        Σ *= jnp.exp(-Γq * t / 2.0).prod(axis=0) * bracket.prod(axis=0)
+
+    return Σ.squeeze(0)               # (T,)
 
 
-def bloch_from_parameters(t, bloch_main, θ):
+def bloch_from_parameters(t, init_config, θ, n_spec):
     """Decode parameter vector θ → Bloch vector array (3,T)."""
     
+    bloch_main = init_config["bloch-main"]
     x0, y0, z0 = bloch_main
+    z_spec = init_config["z-spec"]
     
-    γ_φ  = jnp.abs(θ[0])     # dephasing rate
-    γ_down = jnp.abs(θ[1])    # amplitude damping rate
-    ω_0 = θ[2]
+    γ_φ  = jnp.abs(θ[:n_spec+1])     # dephasing rate
+    γ_down = jnp.abs(θ[n_spec+1])    # amplitude damping rate
+    J_0q = θ[n_spec+2: 2*n_spec+2]   # ZZ crosstalk strength
+    ω_0 = θ[2*n_spec+2]
     
-    Γ_0 = 2 * γ_φ + 0.5 * γ_down
+    Γ_0 = 2 * γ_φ[0] + 0.5 * γ_down
+    Γ_q = γ_φ[1:]
     
-    Σ  = sigma_plus_general(t, x0, y0, ω_0, Γ_0)
+
+    Σ  = sigma_plus_general(t, x0, y0, ω_0, Γ_0, J_0q, Γ_q, z_spec)
     vx =  2.0 * Σ.real
     vy = -2.0 * Σ.imag
     vz = 1 + (z0 - 1) * jnp.exp(-γ_down * t)
 
     return jnp.stack([vx, vy, vz])    # (3,T)
 
+# -----------------------------------------------------------------------------
+#  Fitting routine
+# -----------------------------------------------------------------------------
 
-def fit_lindblad(csv_path: str | Path,
-                 lr: float = 1e-2,
-                 steps: int = 5000,
-                 seed: int = 0,
-                 plot: bool = False,
-                 verbose: bool = False):
-
-    # ------- load experiment -----------------------------------------------
+def fit_crosstalk(csv_path: str | Path,
+                  n_spec: int,
+                  lr: float = 1e-2,
+                  steps: int = 5000,
+                  seed: int = 0,
+                  plot: bool = False,
+                  verbose: bool = False):
+    """Fit ZZ‑crosstalk parameters to a CSV containing Bloch trajectories."""
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
 
@@ -95,17 +126,21 @@ def fit_lindblad(csv_path: str | Path,
     bloch_exp = jnp.asarray(df[["X_mean", "Y_mean", "Z_mean"]].to_numpy().T,
                             dtype=jnp.float64)  # (3,T)
 
-    bloch0_main = parse_initial_state(csv_path)
+    bloch0_main, z_spec_init = parse_initial_state(csv_path, n_spec)
+    init_config = {
+        'bloch-main': bloch0_main, # list of bloch vectors 
+        'z-spec': z_spec_init,     # list of pauli Z expectation of spectator qubits
+    }
 
     # ---- build initial θ --------------------------------------------------
     key = jax.random.PRNGKey(seed)
-    θ   = jax.random.normal(key, (3,)) * 0.05  # small noise
+    θ   = jax.random.normal(key, (3 + 2 * n_spec,)) * 0.05  # small noise
 
-
-    # ------- loss -----------------------------------------------------------
+    # ---- loss -------------------------------------------------------------
     def loss_fn(θ):
-        pred = bloch_from_parameters(t_exp, bloch0_main, θ)
-        return jnp.mean((pred - bloch_exp) ** 2)
+        pred = bloch_from_parameters(t_exp, init_config, θ, n_spec)
+        mse_loss = jnp.mean((pred - bloch_exp) ** 2)
+        return mse_loss
 
     opt = optax.adam(lr)
     opt_state = opt.init(θ)
@@ -122,11 +157,16 @@ def fit_lindblad(csv_path: str | Path,
         if verbose and k % 100 == 0:
             print(f"[{k:5d}] loss = {float(L):.5e}")
 
-    #---- results ----------------------------------------------------------
-    names = ["γ_φ", "γ_↓", "ω_0"]
+    # ---- results ----------------------------------------------------------
+    names = [
+        *[f"γ_φ{q}" for q in range(0, n_spec+1)], 
+        "γ_↓",
+        *[f"J_0{q}" for q in range(1, n_spec + 1)],
+        "ω_0",
+    ]
 
     print("\nFitted parameters (physical values)")
-    θ = θ.at[:2].set(jnp.abs(θ[:2]))
+    θ = θ.at[:n_spec+2].set(jnp.abs(θ[:n_spec+2]))
     
     
     for n, v in zip(names, θ):
@@ -135,7 +175,7 @@ def fit_lindblad(csv_path: str | Path,
     print(f"Final weighted MSE  = {float(loss_fn(θ)):.4e}\n")
 
     if plot:
-        bloch_fit = bloch_from_parameters(t_exp, bloch0_main, θ)
+        bloch_fit = bloch_from_parameters(t_exp, init_config, θ, n_spec)
         col = ["#0096c7", "#48cae4", "#ade8f4"]
         plt.figure(figsize=(10, 5))
         for i, pauli in enumerate("XYZ"):
