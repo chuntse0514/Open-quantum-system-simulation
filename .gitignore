@@ -2,3 +2,4 @@ __pycache__
 test.ipynb
 .DS_Store
 results/
+notebook/Process_tomography_bloch_visualize.ipynb
